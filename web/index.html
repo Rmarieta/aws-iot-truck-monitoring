@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Cold-Chain — Live Fleet</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <style>
+    html, body { margin: 0; height: 100%; font-family: system-ui, sans-serif; }
+    #map { height: 100vh; }
+    #panel {
+      position: absolute; top: 12px; right: 12px; z-index: 1000;
+      background: #fff; padding: 12px 14px; border-radius: 8px;
+      box-shadow: 0 1px 6px rgba(0,0,0,.3); min-width: 220px;
+    }
+    #panel h3 { margin: 0 0 6px; font-size: 14px; }
+    #panel .row { font-size: 13px; margin: 2px 0; }
+    #device-search {
+      width: 160px; padding: 3px 6px; font-size: 12px;
+      border: 1px solid #ccc; border-radius: 4px;
+    }
+    #device-go {
+      padding: 3px 8px; font-size: 12px; margin-left: 4px;
+      border: 1px solid #ccc; border-radius: 4px; background: #f4f4f4; cursor: pointer;
+    }
+    #device-go:hover { background: #e8e8e8; }
+    #fleet-count { font-size: 12px; color: #7f8c8d; margin: 2px 0 8px; }
+    #hint { font-size: 11px; color: #95a5a6; margin-top: 8px; }
+    .warn { color: #c0392b; font-weight: 600; }
+    .ok { color: #27ae60; }
+    .muted { color: #7f8c8d; }
+    #conn { font-weight: 600; }
+    #conn .dot {
+      display: inline-block; width: 9px; height: 9px; border-radius: 50%;
+      margin-right: 5px; vertical-align: middle;
+    }
+    /* Leaflet tooltip used as a permanent device-id label on each marker. */
+    .device-label {
+      background: rgba(255,255,255,.9); border: 1px solid #ccc; box-shadow: none;
+      font-size: 11px; padding: 0 4px; color: #222; font-weight: 600;
+    }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div id="panel">
+    <h3 id="device-title">Fleet</h3>
+    <div id="fleet-count">loading fleet…</div>
+    <div class="row">
+      <input id="device-search" type="text" placeholder="jump to device id"
+             autocomplete="off" spellcheck="false" />
+      <button id="device-go">View</button>
+    </div>
+    <div class="row" id="conn">connection: —</div>
+    <div class="row" id="temp">temp: —</div>
+    <div class="row" id="battery">battery: —</div>
+    <div class="row" id="pos">pos: —</div>
+    <div class="row" id="ts">last: —</div>
+    <div class="row" id="status">—</div>
+    <div id="hint">Click any truck on the map to see its details.</div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <!-- Local, gitignored: sets window.READINGS_URL to the deployed API base.
+       Copy config.example.js -> config.js and fill in the Terraform output. -->
+  <script src="config.js"></script>
+  <script>
+    // READINGS_URL is the API base ".../readings"; the other paths share the
+    // same base, so derive them by swapping the trailing segment.
+    const READINGS_URL = window.READINGS_URL || "REPLACE_WITH_dashboard_readings_url";
+    const STATUS_URL  = READINGS_URL.replace(/\/readings$/, "/status");
+    const DEVICES_URL = READINGS_URL.replace(/\/readings$/, "/devices");
+
+    const THRESHOLD_C = 8;        // excursion threshold (see variables.tf)
+    const POLL_MS = 5000;
+    const WINDOW_MIN = 30;        // readings window
+
+    let selected = null;          // currently-selected device id (null = none)
+    let didInitialFit = false;    // fit map to the fleet only once
+
+    const map = L.map("map").setView([46.948, 7.447], 6);
+    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      attribution: "&copy; OpenStreetMap", maxZoom: 19,
+    }).addTo(map);
+
+    // device_id -> Leaflet marker, so each poll updates in place.
+    const markers = new Map();
+
+    const CONN_COLOR = { ONLINE: "#27ae60", OFFLINE: "#c0392b", UNKNOWN: "#7f8c8d" };
+
+    // "3 min ago" / "just now" from an ISO timestamp.
+    function since(iso) {
+      if (!iso) return "unknown";
+      const secs = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
+      if (secs < 60) return "just now";
+      if (secs < 3600) return `${Math.floor(secs / 60)} min ago`;
+      if (secs < 86400) return `${Math.floor(secs / 3600)} h ago`;
+      return `${Math.floor(secs / 86400)} d ago`;
+    }
+
+    function markerColor(reading) {
+      const warm = reading.temperature_c != null && reading.temperature_c > THRESHOLD_C;
+      return warm ? "#c0392b" : "#27ae60";
+    }
+
+    // --- Fleet poll: one marker per device, all clickable ---------------
+    async function tickFleet() {
+      let fleet;
+      try {
+        const res = await fetch(`${DEVICES_URL}?minutes=${WINDOW_MIN}`);
+        fleet = await res.json();
+      } catch (e) {
+        document.getElementById("fleet-count").textContent = "fleet: error loading";
+        return;
+      }
+      if (!Array.isArray(fleet)) return;
+
+      document.getElementById("fleet-count").textContent =
+        `${fleet.length} device${fleet.length === 1 ? "" : "s"} in last ${WINDOW_MIN} min`;
+
+      const seen = new Set();
+      const bounds = [];
+      for (const r of fleet) {
+        if (r.lat == null || r.lon == null) continue;
+        seen.add(r.device_id);
+        bounds.push([r.lat, r.lon]);
+        const color = markerColor(r);
+        const isSel = r.device_id === selected;
+
+        let m = markers.get(r.device_id);
+        if (!m) {
+          m = L.circleMarker([r.lat, r.lon], { radius: 8 }).addTo(map);
+          // Label shows on hover only; the selected truck is pinned below.
+          m.bindTooltip(r.device_id, {
+            permanent: false, direction: "top", className: "device-label", offset: [0, -6],
+          });
+          m._perm = false;
+          m.on("click", () => selectDevice(r.device_id));
+          markers.set(r.device_id, m);
+        } else {
+          m.setLatLng([r.lat, r.lon]);
+        }
+        // Pin the label on the selected truck only; all others show on hover.
+        if (m._perm !== isSel) {
+          m.unbindTooltip();
+          m.bindTooltip(r.device_id, {
+            permanent: isSel, direction: "top", className: "device-label", offset: [0, -6],
+          });
+          m._perm = isSel;
+          if (isSel) m.openTooltip();
+        }
+        // Selected device gets a bigger radius + dark outline so it stands out.
+        m.setStyle({
+          color: isSel ? "#1a1a1a" : color,
+          weight: isSel ? 3 : 1,
+          fillColor: color,
+          fillOpacity: 0.85,
+          radius: isSel ? 11 : 8,
+        });
+      }
+
+      // Drop markers for devices that aged out of the window.
+      for (const [id, m] of markers) {
+        if (!seen.has(id)) { map.removeLayer(m); markers.delete(id); }
+      }
+
+      // Fit the map to the whole fleet once, so you see everyone on first load.
+      if (!didInitialFit && bounds.length) {
+        map.fitBounds(bounds, { padding: [40, 40], maxZoom: 13 });
+        didInitialFit = true;
+      }
+    }
+
+    // --- Selection: focus one device, drive the detail panel ------------
+    function selectDevice(id) {
+      if (!id) return;
+      selected = id;
+      document.getElementById("device-title").textContent = id;
+      document.getElementById("status").textContent = "loading…";
+      const m = markers.get(id);
+      if (m) map.setView(m.getLatLng(), Math.max(map.getZoom(), 12));
+      tickFleet();     // re-style so the newly-selected marker highlights
+      tickDetail();    // pull its readings immediately
+      tickStatus();    // and its connection state
+    }
+
+    // --- Selected-device connection state -------------------------------
+    async function tickStatus() {
+      if (!selected) return;
+      const el = document.getElementById("conn");
+      try {
+        const res = await fetch(`${STATUS_URL}?device_id=${encodeURIComponent(selected)}`);
+        const s = await res.json();
+        const state = s.conn_state || "UNKNOWN";
+        const color = CONN_COLOR[state] || CONN_COLOR.UNKNOWN;
+        let text = `<span class="dot" style="background:${color}"></span>${state}`;
+        if (s.conn_changed_at) {
+          text += ` <span class="muted">since ${since(s.conn_changed_at)}</span>`;
+        }
+        if (state === "OFFLINE" && s.disconnect_reason) {
+          const clean = s.disconnect_reason === "CLIENT_INITIATED_DISCONNECT";
+          text += ` <span class="muted">(${clean ? "clean" : "ungraceful"})</span>`;
+        }
+        el.innerHTML = `connection: ${text}`;
+      } catch (e) {
+        el.innerHTML = `connection: <span class="muted">error</span>`;
+      }
+    }
+
+    // --- Selected-device detail panel -----------------------------------
+    async function tickDetail() {
+      if (!selected) return;
+      try {
+        const res = await fetch(`${READINGS_URL}?device_id=${encodeURIComponent(selected)}&minutes=${WINDOW_MIN}`);
+        const data = await res.json();
+        if (!Array.isArray(data) || data.length === 0) {
+          document.getElementById("status").textContent = `no readings in last ${WINDOW_MIN} min`;
+          document.getElementById("temp").textContent = "temp: —";
+          document.getElementById("battery").textContent = "battery: —";
+          document.getElementById("pos").textContent = "pos: —";
+          document.getElementById("ts").textContent = "last: —";
+          return;
+        }
+        const latest = data[0];
+        const { lat, lon, temperature_c, time, battery_pct } = latest;
+
+        const warm = temperature_c != null && temperature_c > THRESHOLD_C;
+        document.getElementById("temp").innerHTML =
+          temperature_c != null
+            ? `temp: <span class="${warm ? "warn" : "ok"}">${temperature_c}°C</span>` + (warm ? " ⚠ excursion" : "")
+            : "temp: —";
+        document.getElementById("pos").textContent =
+          (lat != null && lon != null) ? `pos: ${lat.toFixed(5)}, ${lon.toFixed(5)}` : "pos: —";
+        if (battery_pct != null) {
+          const low = battery_pct < 20;
+          document.getElementById("battery").innerHTML =
+            `battery: <span class="${low ? "warn" : "ok"}">${battery_pct}%</span>` + (low ? " ⚠ low" : "");
+        } else {
+          document.getElementById("battery").textContent = "battery: —";
+        }
+        document.getElementById("ts").textContent = `last: ${time}`;
+        document.getElementById("status").textContent = `${data.length} readings / ${WINDOW_MIN} min`;
+      } catch (e) {
+        document.getElementById("status").textContent = "error: " + e.message;
+      }
+    }
+
+    // --- Search box: jump to any device id by name ----------------------
+    function goFromSearch() {
+      const v = document.getElementById("device-search").value.trim();
+      if (v) selectDevice(v);
+    }
+    document.getElementById("device-go").addEventListener("click", goFromSearch);
+    document.getElementById("device-search").addEventListener("keydown", (e) => {
+      if (e.key === "Enter") goFromSearch();
+    });
+
+    // --- Bootstrap ------------------------------------------------------
+    // Draw the fleet first; default-select truck-0 if it's present so the
+    // panel isn't empty on load (falls back to whatever the fleet shows).
+    (async function start() {
+      await tickFleet();
+      if (!selected) selectDevice(markers.has("truck-0") ? "truck-0" : [...markers.keys()][0]);
+    })();
+
+    setInterval(tickFleet, POLL_MS);
+    setInterval(tickDetail, POLL_MS);
+    setInterval(tickStatus, POLL_MS);
+  </script>
+</body>
+</html>

@@ -1,0 +1,9 @@
+# Copy to terraform.tfvars (gitignored) and fill in your values.
+#   cp terraform.tfvars.example terraform.tfvars
+
+notification_email = "you@example.com"
+
+# Optional overrides:
+# region      = "eu-central-1"
+# aws_profile = "training"
+# name_prefix = "coldchain"

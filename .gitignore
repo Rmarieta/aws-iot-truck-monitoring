@@ -1,0 +1,54 @@
+# ---- Terraform ----
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
+crash.log
+crash.*.log
+terraform.tfvars
+*.auto.tfvars
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+backend.hcl
+
+# ---- IoT cert material (never commit) ----
+*.pem
+*.key
+*.crt
+*.pub
+certs/
+devices/**/cert/
+
+# ---- Secrets / credentials (never commit) ----
+.env
+.env.*
+credentials
+
+# ---- Local dashboard config (account-specific API URL) ----
+web/config.js
+
+# ---- Device store-and-forward buffer (local runtime state) ----
+*.jsonl
+telemetry-buffer.jsonl
+
+# ---- Build artifacts ----
+*.zip
+__pycache__/
+*.pyc
+.venv/
+venv/
+node_modules/
+
+# ---- Flink build dependencies (fetched, not committed) ----
+flink/lib/
+*.jar
+
+# ---- OS / editor ----
+.DS_Store
+*.swp
+.idea/
+.vscode/

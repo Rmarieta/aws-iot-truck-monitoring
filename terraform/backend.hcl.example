@@ -1,0 +1,8 @@
+# Backend config template — SAFE to commit.
+# Copy to backend.hcl (gitignored) and fill in your own values:
+#   cp backend.hcl.example backend.hcl
+# Then: terraform init -backend-config=backend.hcl
+#
+# The bucket must already exist. Locking uses S3-native conditional writes,
+# so no DynamoDB lock table is needed.
+bucket = "<your-tfstate-bucket-name>"
